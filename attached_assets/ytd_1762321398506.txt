@@ -1,0 +1,459 @@
+import readline from "readline";
+import { spawn } from "child_process";
+
+const rl = readline.createInterface({
+  input: process.stdin,
+  output: process.stdout
+});
+
+function ask(q) {
+  return new Promise(res => rl.question(q, res));
+}
+
+// Execute command and get output
+async function executeCommand(command, args) {
+  return new Promise((resolve, reject) => {
+    const proc = spawn(command, args);
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => {
+      stdout += data.toString();
+    });
+
+    proc.stderr.on('data', (data) => {
+      stderr += data.toString();
+    });
+
+    proc.on('close', (code) => {
+      if (code === 0) {
+        resolve(stdout);
+      } else {
+        reject(new Error(`Command failed: ${stderr}`));
+      }
+    });
+
+    proc.on('error', reject);
+  });
+}
+
+// Improved file size parsing
+function parseFileSize(sizeStr) {
+  if (!sizeStr || sizeStr === 'N/A' || sizeStr === '~') return 0;
+  
+  const match = sizeStr.match(/(\d+\.?\d*)\s*([KMGT])?i?B?/i);
+  if (!match) return 0;
+  
+  const num = parseFloat(match[1]);
+  const unit = (match[2] || 'B').toUpperCase();
+  
+  const multipliers = {
+    'B': 1,
+    'K': 1024,
+    'M': 1024 * 1024,
+    'G': 1024 * 1024 * 1024,
+    'T': 1024 * 1024 * 1024 * 1024
+  };
+  
+  return num * (multipliers[unit] || 1);
+}
+
+// Format file size for display
+function formatFileSize(bytes) {
+  if (typeof bytes !== 'number' || isNaN(bytes) || bytes === 0) return 'N/A';
+  
+  const units = ['B', 'KiB', 'MiB', 'GiB'];
+  let size = bytes;
+  let unitIndex = 0;
+  
+  while (size >= 1024 && unitIndex < units.length - 1) {
+    size /= 1024;
+    unitIndex++;
+  }
+  
+  return unitIndex === 0 ? `${size} ${units[unitIndex]}` : `${size.toFixed(2)} ${units[unitIndex]}`;
+}
+
+async function main() {
+  try {
+    const url = await ask("Enter YouTube URL: ");
+    
+    console.log("\n⏳ Fetching formats and calculating total sizes...\n");
+
+    // Get all formats with file sizes
+    const formatsOutput = await executeCommand('yt-dlp', [
+      '-F',
+      '--no-warnings',
+      url
+    ]);
+
+    const lines = formatsOutput.split('\n');
+    const videoFormats = [];
+    const audioFormats = [];
+
+    // Parse ALL formats including video-only
+    for (const line of lines) {
+      if (!line.trim() || !line.match(/^\d/)) continue;
+
+      const cleanLine = line.trim();
+      
+      // Extract format ID (first number)
+      const idMatch = cleanLine.match(/^(\d+)/);
+      if (!idMatch) continue;
+      const id = idMatch[1];
+      
+      // Extract extension (second field)
+      const extMatch = cleanLine.match(/^\d+\s+(\S+)/);
+      const ext = extMatch ? extMatch[1] : 'unknown';
+      
+      // Extract resolution
+      let resolution = 'unknown';
+      if (cleanLine.includes('audio only')) {
+        resolution = 'audio';
+      } else {
+        const resMatch = cleanLine.match(/(\d+x\d+)/);
+        resolution = resMatch ? resMatch[1] : 'unknown';
+      }
+      
+      // Extract file size
+      let size = 'N/A';
+      const sizeMatch = cleanLine.match(/(\d+\.?\d*\s*[KMGT]?i?B)(?=\s|$)/i);
+      if (sizeMatch) {
+        size = sizeMatch[1];
+      } else {
+        const approxMatch = cleanLine.match(/~?\s*(\d+\.?\d*\s*[KMGT]?i?B)/i);
+        if (approxMatch) {
+          size = approxMatch[1].replace('~', '').trim();
+        }
+      }
+
+      // Extract codec information more accurately
+      let codec = 'unknown';
+      if (cleanLine.includes('avc1')) codec = 'h264';
+      else if (cleanLine.includes('vp9')) codec = 'vp9';
+      else if (cleanLine.includes('av01')) codec = 'av1';
+      else if (cleanLine.includes('mp4a')) codec = 'aac';
+      else if (cleanLine.includes('opus')) codec = 'opus';
+      else if (cleanLine.includes('mp3')) codec = 'mp3';
+      else if (cleanLine.includes('ac-3')) codec = 'ac3';
+      else if (cleanLine.includes('flac')) codec = 'flac';
+
+      // Determine type
+      if (cleanLine.includes('audio only')) {
+        audioFormats.push({ id, ext, res: 'audio', size, type: 'audio', codec, line: cleanLine });
+      } else if (cleanLine.includes('video only') || cleanLine.includes('av01') || cleanLine.includes('vp9') || cleanLine.includes('avc1')) {
+        videoFormats.push({ id, ext, res: resolution, size, type: 'video-only', codec, line: cleanLine });
+      } else {
+        videoFormats.push({ id, ext, res: resolution, size, type: 'combined', codec, line: cleanLine });
+      }
+    }
+
+    console.log(`Found ${videoFormats.length} video formats and ${audioFormats.length} audio formats`);
+
+    // Find the best COMPATIBLE audio format (prioritize AAC for TV compatibility)
+    let bestAudio = null;
+    
+    // First, try to find actual AAC formats
+    const aacFormats = audioFormats.filter(audio => 
+      audio.codec === 'aac' || 
+      audio.ext === 'm4a' || 
+      audio.line.includes('mp4a') ||
+      audio.line.toLowerCase().includes('aac')
+    );
+
+    if (aacFormats.length > 0) {
+      // Sort AAC formats by quality (largest file size)
+      aacFormats.sort((a, b) => parseFileSize(b.size) - parseFileSize(a.size));
+      bestAudio = aacFormats[0];
+      console.log(`🔊 Best AAC audio: ${bestAudio.id} (${bestAudio.ext}, ${bestAudio.size})`);
+    } else {
+      // If no AAC found, look for MP3 as fallback
+      const mp3Formats = audioFormats.filter(audio => 
+        audio.codec === 'mp3' || audio.ext === 'mp3'
+      );
+      
+      if (mp3Formats.length > 0) {
+        mp3Formats.sort((a, b) => parseFileSize(b.size) - parseFileSize(a.size));
+        bestAudio = mp3Formats[0];
+        console.log(`🔊 Best MP3 audio (AAC not available): ${bestAudio.id} (${bestAudio.ext}, ${bestAudio.size})`);
+      } else {
+        // Last resort: use any audio but we'll need to convert it
+        if (audioFormats.length > 0) {
+          audioFormats.sort((a, b) => parseFileSize(b.size) - parseFileSize(a.size));
+          bestAudio = audioFormats[0];
+          console.log(`⚠️  No AAC/MP3 audio found. Using ${bestAudio.codec}: ${bestAudio.id} (will convert to AAC)`);
+        } else {
+          console.log("⚠️  No audio formats found");
+        }
+      }
+    }
+
+    // Group video formats by resolution
+    const resolutionGroups = {};
+    for (const format of videoFormats) {
+      if (format.res !== 'audio' && format.res !== 'unknown') {
+        if (!resolutionGroups[format.res]) {
+          resolutionGroups[format.res] = [];
+        }
+        resolutionGroups[format.res].push(format);
+      }
+    }
+
+    // Map resolutions to quality options
+    const qualityOptions = {
+      '144p': '256x144',
+      '240p': '426x240', 
+      '360p': '640x360',
+      '480p': '854x480',
+      '720p': '1280x720',
+      '1080p': '1920x1080',
+      '1440p': '2560x1440',
+      '2160p': '3840x2160'
+    };
+
+    console.log("\n📊 Available Resolutions with TOTAL File Sizes:\n");
+    
+    // Show available resolutions with TOTAL file sizes
+    let optionNumber = 1;
+    const availableOptions = {};
+    
+    for (const [quality, resolution] of Object.entries(qualityOptions)) {
+      if (resolutionGroups[resolution]) {
+        const group = resolutionGroups[resolution];
+        
+        // Sort: prefer formats that can be downloaded directly, then by file size
+        group.sort((a, b) => {
+          const aScore = getFormatDownloadScore(a);
+          const bScore = getFormatDownloadScore(b);
+          if (bScore !== aScore) return bScore - aScore;
+          
+          return parseFileSize(a.size) - parseFileSize(b.size);
+        });
+        
+        const bestFormat = group[0];
+        let totalSizeBytes, displaySize, description;
+        
+        if (bestFormat.type === 'combined' && canDownloadDirectly(bestFormat)) {
+          totalSizeBytes = parseFileSize(bestFormat.size);
+          displaySize = formatFileSize(totalSizeBytes);
+          description = `✓ direct download`;
+        } else {
+          const videoSize = parseFileSize(bestFormat.size);
+          const audioSize = bestAudio ? parseFileSize(bestAudio.size) : 0;
+          totalSizeBytes = videoSize + audioSize;
+          displaySize = formatFileSize(totalSizeBytes);
+          
+          if (bestAudio) {
+            if (bestAudio.codec === 'aac') {
+              description = `merge with AAC audio`;
+            } else {
+              description = `merge with ${bestAudio.codec} (convert to AAC)`;
+            }
+          } else {
+            description = `video only`;
+          }
+        }
+        
+        console.log(`${optionNumber}. ${quality.padEnd(8)} - ${displaySize.padEnd(12)} (${description})`);
+        availableOptions[optionNumber] = { 
+          quality, 
+          resolution,
+          formatId: bestFormat.id,
+          formatType: bestFormat.type,
+          totalSize: displaySize,
+          description: description,
+          canDownloadDirectly: canDownloadDirectly(bestFormat),
+          audioId: bestAudio?.id,
+          audioCodec: bestAudio?.codec
+        };
+        optionNumber++;
+      }
+    }
+    
+    // Add best available option - ALWAYS use merge with compatible audio
+    if (videoFormats.length > 0) {
+      const allFormats = [...videoFormats];
+      allFormats.sort((a, b) => {
+        const aHeight = a.res === 'audio' ? 0 : parseInt(a.res.split('x')[1]) || 0;
+        const bHeight = b.res === 'audio' ? 0 : parseInt(b.res.split('x')[1]) || 0;
+        return bHeight - aHeight;
+      });
+      
+      const bestFormat = allFormats[0];
+      const videoSize = parseFileSize(bestFormat.size);
+      const audioSize = bestAudio ? parseFileSize(bestAudio.size) : 0;
+      const totalSize = videoSize + audioSize;
+      const displaySize = formatFileSize(totalSize);
+      
+      let audioDesc = 'audio';
+      if (bestAudio) {
+        audioDesc = bestAudio.codec === 'aac' ? 'AAC audio' : `${bestAudio.codec} (convert to AAC)`;
+      }
+      
+      console.log(`${optionNumber}. Best available - ${displaySize.padEnd(12)} (merge with ${audioDesc})`);
+      availableOptions[optionNumber] = { 
+        quality: 'best', 
+        resolution: 'best', 
+        formatId: 'bestvideo',
+        formatType: 'merge',
+        totalSize: displaySize,
+        description: `merge with ${audioDesc}`,
+        canDownloadDirectly: false,
+        audioId: bestAudio?.id,
+        audioCodec: bestAudio?.codec
+      };
+    }
+
+    if (Object.keys(availableOptions).length === 0) {
+      console.log("❌ No video formats found!");
+      rl.close();
+      return;
+    }
+
+    const choice = await ask(`\nEnter your choice (1-${optionNumber}): `);
+    const selectedOption = availableOptions[parseInt(choice)];
+
+    if (!selectedOption) {
+      console.log("❌ Invalid choice. Exiting.");
+      rl.close();
+      return;
+    }
+
+    console.log(`\n🎬 Downloading ${selectedOption.quality}...`);
+    console.log(`📦 Estimated size: ${selectedOption.totalSize}`);
+    console.log(`   ${selectedOption.description}`);
+    console.log("⏳ Starting download...\n");
+    
+    let downloadArgs;
+    
+    // Base arguments
+    const baseArgs = [
+      '--no-warnings',
+      '-o', '%(title)s.%(ext)s'
+    ];
+
+    // Check if we need to convert audio to AAC
+    const needsAudioConversion = selectedOption.audioCodec && selectedOption.audioCodec !== 'aac';
+    
+    if (selectedOption.quality === 'best') {
+      if (needsAudioConversion) {
+        // Use post-processing to convert to AAC
+        downloadArgs = [
+          ...baseArgs,
+          '-f', 'bestvideo+bestaudio',
+          '--merge-output-format', 'mp4',
+          '--postprocessor-args', '-c:a aac -b:a 192k',
+          url
+        ];
+        console.log(`⚡ Merging best video + audio (converting ${selectedOption.audioCodec} to AAC)`);
+      } else {
+        // Use specific AAC audio format
+        downloadArgs = [
+          ...baseArgs,
+          '-f', 'bestvideo+bestaudio[ext=m4a]',
+          '--merge-output-format', 'mp4',
+          url
+        ];
+        console.log("⚡ Merging best video + AAC audio");
+      }
+    } else if (selectedOption.canDownloadDirectly) {
+      downloadArgs = [
+        ...baseArgs,
+        '-f', selectedOption.formatId,
+        url
+      ];
+      console.log("⚡ Direct download");
+    } else {
+      if (needsAudioConversion) {
+        // Convert non-AAC audio to AAC during merge
+        downloadArgs = [
+          ...baseArgs,
+          '-f', `${selectedOption.formatId}+bestaudio`,
+          '--merge-output-format', 'mp4',
+          '--postprocessor-args', '-c:a aac -b:a 192k',
+          url
+        ];
+        console.log(`⚡ Merging video + audio (converting ${selectedOption.audioCodec} to AAC)`);
+      } else {
+        // Use AAC audio directly
+        downloadArgs = [
+          ...baseArgs,
+          '-f', `${selectedOption.formatId}+bestaudio[ext=m4a]`,
+          '--merge-output-format', 'mp4',
+          url
+        ];
+        console.log("⚡ Merging video + AAC audio");
+      }
+    }
+
+    // Only use ffmpeg downloader for merging operations
+    if (!selectedOption.canDownloadDirectly) {
+      downloadArgs.splice(1, 0, '--downloader', 'ffmpeg');
+      downloadArgs.splice(3, 0, '--downloader-args', 'ffmpeg_i:-reconnect 1 -reconnect_at_eof 1 -reconnect_streamed 1 -reconnect_delay_max 2');
+      
+      // Check if ffmpeg is available
+      try {
+        await executeCommand('ffmpeg', ['-version']);
+        console.log("✅ ffmpeg is available for merging and conversion");
+      } catch (error) {
+        console.log("⚠️  ffmpeg not found. Using internal merger (audio conversion may not work).");
+        downloadArgs = downloadArgs.filter(arg => !['--downloader', '--downloader-args', '--postprocessor-args'].includes(arg));
+      }
+    }
+    
+    await new Promise((resolve, reject) => {
+      console.log(`Running: yt-dlp ${downloadArgs.join(' ')}`);
+      const proc = spawn('yt-dlp', downloadArgs, { stdio: 'inherit' });
+
+      proc.on('close', (code) => {
+        if (code === 0) resolve();
+        else reject(new Error(`Download failed with code ${code}`));
+      });
+      
+      proc.on('error', reject);
+    });
+
+    console.log("\n✅ Download complete! (AAC audio for TV compatibility)");
+
+  } catch (error) {
+    console.error("❌ Error:", error.message);
+    if (error.message.includes('ffmpeg')) {
+      console.log("💡 Tip: Install ffmpeg for better merging:");
+      console.log("   pkg install ffmpeg");
+    } else if (error.message.includes('format is not available')) {
+      console.log("💡 Tip: The selected format may not be available. Try a different resolution.");
+    }
+  } finally {
+    rl.close();
+  }
+}
+
+// Helper function to determine if a format can be downloaded directly
+function canDownloadDirectly(format) {
+  const directFormats = ['mp4', 'webm', 'm4a'];
+  const mergeFormats = ['av01', 'vp9', 'avc1'];
+  
+  const formatStr = format.line.toLowerCase();
+  
+  if (formatStr.includes('video only')) return false;
+  
+  for (const codec of mergeFormats) {
+    if (formatStr.includes(codec)) return false;
+  }
+  
+  return directFormats.includes(format.ext.toLowerCase());
+}
+
+// Helper function to score formats for download preference
+function getFormatDownloadScore(format) {
+  let score = 0;
+  const formatStr = format.line.toLowerCase();
+  
+  if (canDownloadDirectly(format)) score += 10;
+  if (format.ext === 'mp4') score += 5;
+  if (!formatStr.includes('video only')) score += 3;
+  
+  return score;
+}
+
+main();
